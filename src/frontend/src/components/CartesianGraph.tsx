@@ -31,6 +31,56 @@ export function hashColor(name: string): string {
   return LABEL_COLORS[Math.abs(hash) % LABEL_COLORS.length];
 }
 
+// Wrap text into lines that fit within maxWidth (approximate char-based)
+function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
+  // Approximate: average char width is ~0.55 * fontSize for sans-serif
+  const avgCharWidth = fontSize * 0.58;
+  const charsPerLine = Math.max(3, Math.floor(maxWidth / avgCharWidth));
+  if (text.length <= charsPerLine) return [text];
+
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    const test = current ? `${current} ${word}` : word;
+    if (test.length <= charsPerLine) {
+      current = test;
+    } else {
+      if (current) lines.push(current);
+      // If single word is too long, force-break it
+      if (word.length > charsPerLine) {
+        let w = word;
+        while (w.length > charsPerLine) {
+          lines.push(`${w.slice(0, charsPerLine - 1)}-`);
+          w = w.slice(charsPerLine - 1);
+        }
+        current = w;
+      } else {
+        current = word;
+      }
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+interface LabelBox {
+  x: number; // left edge
+  y: number; // top edge
+  w: number;
+  h: number;
+}
+
+function boxesOverlap(a: LabelBox, b: LabelBox, margin = 4): boolean {
+  return (
+    a.x < b.x + b.w + margin &&
+    a.x + a.w + margin > b.x &&
+    a.y < b.y + b.h + margin &&
+    a.y + a.h + margin > b.y
+  );
+}
+
 export function CartesianGraph({
   points,
   regions,
@@ -184,75 +234,156 @@ export function CartesianGraph({
     return marks;
   }, [toSvgX, toSvgY, cx, cy, tickLabelFontSize]);
 
-  // Group regions by bounding-box key to detect overlaps
-  const regionsByBBox = useMemo(() => {
-    const map = new Map<string, Region[]>();
-    for (const r of regions) {
-      const key = `${r.x},${r.y},${r.width},${r.height}`;
-      const arr = map.get(key) ?? [];
-      arr.push(r);
-      map.set(key, arr);
-    }
-    return map;
-  }, [regions]);
-
-  // Region elements — stack labels vertically when regions share the same bbox
-  const regionLabelFontSize = Math.max(9, axisLabelFontSize - 2);
+  // Region labels: wrap to fit inside region, then resolve overlaps by nudging vertically
+  const regionLabelFontSize = Math.max(9, Math.min(13, axisLabelFontSize - 1));
   const regionLabelLineH = regionLabelFontSize + 4;
+  const REGION_PADDING = 6; // px inner padding from rect edges
 
-  const regionElements = regions.map((r) => {
-    const color = regionColours?.[r.id.toString()] ?? hashColor(r.name);
-    const rx = toSvgX(r.x - r.width / 2);
-    const ry = toSvgY(r.y + r.height / 2);
-    const rw = (r.width / (2 * RANGE)) * plotW;
-    const rh = (r.height / (2 * RANGE)) * plotH;
+  const regionElements = useMemo(() => {
+    // First pass: compute rect geometry and wrapped text for each region
+    const regionData = regions.map((r) => {
+      const color = regionColours?.[r.id.toString()] ?? hashColor(r.name);
+      const rx = toSvgX(r.x - r.width / 2);
+      const ry = toSvgY(r.y + r.height / 2);
+      const rw = (r.width / (2 * RANGE)) * plotW;
+      const rh = (r.height / (2 * RANGE)) * plotH;
 
-    const bboxKey = `${r.x},${r.y},${r.width},${r.height}`;
-    const group = regionsByBBox.get(bboxKey) ?? [r];
-    const idx = group.findIndex((g) => g.id === r.id);
-    const total = group.length;
+      // Available width for text inside the rect
+      const availableW = Math.max(10, rw - REGION_PADDING * 2);
+      const lines = wrapText(r.name, availableW, regionLabelFontSize);
+      const textBlockH = lines.length * regionLabelLineH;
 
-    // Vertical offset so stacked labels are centred inside the rect
-    const totalTextH = total * regionLabelLineH;
-    const startY =
-      ry +
-      rh / 2 -
-      totalTextH / 2 +
-      idx * regionLabelLineH +
-      regionLabelFontSize / 2;
+      // Ideal centered Y for the text block top
+      const idealCenterY = ry + rh / 2;
+      const idealTopY = idealCenterY - textBlockH / 2;
 
-    return (
-      <g key={r.id.toString()}>
-        <rect
-          x={rx}
-          y={ry}
-          width={rw}
-          height={rh}
-          fill={color}
-          fillOpacity={0.12}
-          stroke={color}
-          strokeOpacity={0.5}
-          strokeWidth={1.5}
-          strokeDasharray="4 2"
-          rx={3}
-        />
-        <text
-          x={rx + rw / 2}
-          y={startY}
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fontSize={regionLabelFontSize}
-          fontFamily="Bricolage Grotesque, system-ui, sans-serif"
-          fontWeight="600"
-          fill={color}
-          fillOpacity={0.9}
-          style={{ pointerEvents: "none" }}
-        >
-          {r.name}
-        </text>
-      </g>
+      return {
+        r,
+        color,
+        rx,
+        ry,
+        rw,
+        rh,
+        lines,
+        textBlockH,
+        idealCenterY,
+        // clamp: keep text inside rect vertically
+        clampedTopY: Math.max(
+          ry + REGION_PADDING,
+          Math.min(idealTopY, ry + rh - textBlockH - REGION_PADDING),
+        ),
+        // label x: center of rect
+        labelX: rx + rw / 2,
+      };
+    });
+
+    // Second pass: resolve label overlap between regions by nudging vertically
+    // Sort by idealCenterY so we process top-to-bottom
+    const sorted = [...regionData].sort(
+      (a, b) => a.idealCenterY - b.idealCenterY,
     );
-  });
+
+    // Track placed label boxes (in SVG coords)
+    const placedBoxes: LabelBox[] = [];
+
+    for (const rd of sorted) {
+      let topY = rd.clampedTopY;
+
+      // Try to find a non-overlapping Y by nudging downward then upward
+      const boxW = rd.rw - REGION_PADDING * 2;
+      const boxH = rd.textBlockH;
+      const candidateBox: LabelBox = {
+        x: rd.labelX - boxW / 2,
+        y: topY,
+        w: boxW,
+        h: boxH,
+      };
+
+      let overlapping = placedBoxes.some((pb) =>
+        boxesOverlap(candidateBox, pb),
+      );
+
+      if (overlapping) {
+        // Try nudging down
+        for (let dy = regionLabelLineH; dy <= 200; dy += regionLabelLineH) {
+          candidateBox.y = topY + dy;
+          overlapping = placedBoxes.some((pb) =>
+            boxesOverlap(candidateBox, pb),
+          );
+          if (!overlapping) {
+            topY = candidateBox.y;
+            break;
+          }
+        }
+        // If still overlapping try nudging up
+        if (overlapping) {
+          for (let dy = regionLabelLineH; dy <= 200; dy += regionLabelLineH) {
+            candidateBox.y = topY - dy;
+            overlapping = placedBoxes.some((pb) =>
+              boxesOverlap(candidateBox, pb),
+            );
+            if (!overlapping) {
+              topY = candidateBox.y;
+              break;
+            }
+          }
+        }
+      }
+
+      placedBoxes.push({ x: rd.labelX - boxW / 2, y: topY, w: boxW, h: boxH });
+      // Store resolved topY back
+      rd.clampedTopY = topY;
+    }
+
+    // Render
+    return regionData.map((rd) => {
+      const { r, color, rx, ry, rw, rh, lines, clampedTopY, labelX } = rd;
+      return (
+        <g key={r.id.toString()}>
+          <rect
+            x={rx}
+            y={ry}
+            width={rw}
+            height={rh}
+            fill={color}
+            fillOpacity={0.12}
+            stroke={color}
+            strokeOpacity={0.5}
+            strokeWidth={1.5}
+            strokeDasharray="4 2"
+            rx={3}
+          />
+          {lines.map((line, i) => (
+            <text
+              // biome-ignore lint/suspicious/noArrayIndexKey: line index is stable for wrapped text segments
+              key={i}
+              x={labelX}
+              y={clampedTopY + i * regionLabelLineH + regionLabelFontSize}
+              textAnchor="middle"
+              dominantBaseline="auto"
+              fontSize={regionLabelFontSize}
+              fontFamily="Bricolage Grotesque, system-ui, sans-serif"
+              fontWeight="600"
+              fill={color}
+              fillOpacity={0.9}
+              style={{ pointerEvents: "none" }}
+            >
+              {line}
+            </text>
+          ))}
+        </g>
+      );
+    });
+  }, [
+    regions,
+    regionColours,
+    toSvgX,
+    toSvgY,
+    plotW,
+    plotH,
+    regionLabelFontSize,
+    regionLabelLineH,
+  ]);
 
   // Group points by coordinate key to detect overlaps
   const pointsByCoord = useMemo(() => {
@@ -266,105 +397,202 @@ export function CartesianGraph({
     return map;
   }, [points]);
 
-  // Point elements — spread overlapping points horizontally
-  const POINT_SPREAD = 14; // px between dots at the same coord
-  const pointElements = points.map((p) => {
-    const color = pointColours?.[p.id.toString()] ?? hashColor(p.name);
-    const basePx = toSvgX(p.x);
-    const basePy = toSvgY(p.y);
+  // Point elements — spread overlapping dots + collision-detect labels
+  const POINT_SPREAD = 16; // px between dots at same coord
+  const pointFontSize = Math.max(9, axisLabelFontSize - 2);
+  const coordFontSize = Math.max(7, tickLabelFontSize);
+  const LABEL_H = pointFontSize + 2 + coordFontSize + 2; // name + coord stacked
 
-    // Find index within the group at this coord
-    const key = `${p.x},${p.y}`;
-    const group = pointsByCoord.get(key) ?? [p];
-    const idx = group.findIndex((g) => g.id === p.id);
-    const total = group.length;
-    // Spread: centre the group around basePx
-    const offsetX = (idx - (total - 1) / 2) * POINT_SPREAD;
-    const px = basePx + offsetX;
-    const py = basePy;
+  const pointElements = useMemo(() => {
+    // Compute initial dot positions (with spread)
+    const dotPositions = points.map((p) => {
+      const basePx = toSvgX(p.x);
+      const basePy = toSvgY(p.y);
+      const key = `${p.x},${p.y}`;
+      const group = pointsByCoord.get(key) ?? [p];
+      const idx = group.findIndex((g) => g.id === p.id);
+      const total = group.length;
+      const offsetX = (idx - (total - 1) / 2) * POINT_SPREAD;
+      return { p, px: basePx + offsetX, py: basePy, basePx, basePy };
+    });
 
-    // Smart label offset: push label away from center
-    const labelDx = p.x >= 0 ? 10 : -10;
-    const labelAnchor = p.x >= 0 ? "start" : "end";
-    const labelDy = p.y >= 0 ? -8 : 14;
-    const pointFontSize = Math.max(9, axisLabelFontSize - 2);
-    const coordFontSize = Math.max(7, tickLabelFontSize);
+    // For each point compute candidate label position, then resolve collisions
+    // Candidate: prefer above-right, above-left, below-right, below-left
+    const labelMargin = 8;
+    const labelW = 80; // approximate label width in px
 
-    // If the dot was shifted, draw a thin line back to the true coordinate
-    const showTether = Math.abs(offsetX) > 1;
+    interface PlacedLabel {
+      x: number; // left edge
+      y: number; // top edge
+      w: number;
+      h: number;
+    }
 
-    return (
-      <g key={p.id.toString()} data-ocid="graph.chart_point">
-        {/* Tether line to true coordinate when spread */}
-        {showTether && (
+    const placedLabels: PlacedLabel[] = [];
+
+    const resolved = dotPositions.map(({ p, px, py, basePx, basePy }) => {
+      const color = pointColours?.[p.id.toString()] ?? hashColor(p.name);
+      const showTether = Math.abs(px - basePx) > 1;
+
+      // Candidate offsets: 4 corners + sides
+      const candidates: {
+        dx: number;
+        dy: number;
+        anchor: "start" | "middle" | "end";
+      }[] = [
+        { dx: labelMargin, dy: -(LABEL_H + labelMargin), anchor: "start" }, // top-right
+        {
+          dx: -labelMargin - labelW,
+          dy: -(LABEL_H + labelMargin),
+          anchor: "start",
+        }, // top-left
+        { dx: labelMargin, dy: labelMargin + 4, anchor: "start" }, // bottom-right
+        { dx: -labelMargin - labelW, dy: labelMargin + 4, anchor: "start" }, // bottom-left
+        { dx: labelMargin, dy: -LABEL_H / 2, anchor: "start" }, // right-middle
+        { dx: -labelMargin - labelW, dy: -LABEL_H / 2, anchor: "start" }, // left-middle
+      ];
+
+      let chosenDx = labelMargin;
+      let chosenDy = -(LABEL_H + labelMargin);
+      let chosenAnchor: "start" | "middle" | "end" = "start";
+      let placed = false;
+
+      for (const c of candidates) {
+        const box: PlacedLabel = {
+          x: px + c.dx,
+          y: py + c.dy,
+          w: labelW,
+          h: LABEL_H,
+        };
+        const overlaps = placedLabels.some((pl) => boxesOverlap(box, pl, 2));
+        if (!overlaps) {
+          chosenDx = c.dx;
+          chosenDy = c.dy;
+          chosenAnchor = c.anchor;
+          placedLabels.push(box);
+          placed = true;
+          break;
+        }
+      }
+
+      // If no candidate worked, nudge upward in steps until clear
+      if (!placed) {
+        for (let extraDy = 0; extraDy <= 300; extraDy += pointFontSize + 4) {
+          const dy = -(LABEL_H + labelMargin + extraDy);
+          const box: PlacedLabel = {
+            x: px + labelMargin,
+            y: py + dy,
+            w: labelW,
+            h: LABEL_H,
+          };
+          const overlaps = placedLabels.some((pl) => boxesOverlap(box, pl, 2));
+          if (!overlaps) {
+            chosenDx = labelMargin;
+            chosenDy = dy;
+            chosenAnchor = "start";
+            placedLabels.push(box);
+            break;
+          }
+        }
+      }
+
+      const nameLy = py + chosenDy;
+      const coordLy = nameLy + pointFontSize + 2;
+
+      return (
+        <g key={p.id.toString()} data-ocid="graph.chart_point">
+          {/* Tether line to true coordinate when spread */}
+          {showTether && (
+            <line
+              x1={px}
+              y1={py}
+              x2={basePx}
+              y2={basePy}
+              stroke={color}
+              strokeOpacity={0.3}
+              strokeWidth={1}
+              strokeDasharray="2 2"
+            />
+          )}
+          {/* Glow */}
+          <circle cx={px} cy={py} r={8} fill={color} fillOpacity={0.15} />
+          {/* Dot */}
+          <circle
+            cx={px}
+            cy={py}
+            r={5}
+            fill={color}
+            stroke="oklch(0.13 0.018 260)"
+            strokeWidth={1.5}
+          />
+          {/* Crosshair lines */}
+          <line
+            x1={px - 3}
+            y1={py}
+            x2={px + 3}
+            y2={py}
+            stroke={color}
+            strokeOpacity={0.5}
+            strokeWidth={1}
+          />
           <line
             x1={px}
-            y1={py}
-            x2={basePx}
-            y2={basePy}
+            y1={py - 3}
+            x2={px}
+            y2={py + 3}
             stroke={color}
-            strokeOpacity={0.3}
+            strokeOpacity={0.5}
             strokeWidth={1}
-            strokeDasharray="2 2"
           />
-        )}
-        {/* Glow */}
-        <circle cx={px} cy={py} r={8} fill={color} fillOpacity={0.15} />
-        {/* Dot */}
-        <circle
-          cx={px}
-          cy={py}
-          r={5}
-          fill={color}
-          stroke="oklch(0.13 0.018 260)"
-          strokeWidth={1.5}
-        />
-        {/* Crosshair lines */}
-        <line
-          x1={px - 3}
-          y1={py}
-          x2={px + 3}
-          y2={py}
-          stroke={color}
-          strokeOpacity={0.5}
-          strokeWidth={1}
-        />
-        <line
-          x1={px}
-          y1={py - 3}
-          x2={px}
-          y2={py + 3}
-          stroke={color}
-          strokeOpacity={0.5}
-          strokeWidth={1}
-        />
-        {/* Label */}
-        <text
-          x={px + labelDx}
-          y={py + labelDy}
-          textAnchor={labelAnchor}
-          fontSize={pointFontSize}
-          fontFamily="Bricolage Grotesque, system-ui, sans-serif"
-          fontWeight="600"
-          fill={color}
-        >
-          {p.name}
-        </text>
-        {/* Coord label */}
-        <text
-          x={px + labelDx}
-          y={py + labelDy + (p.y >= 0 ? -12 : 14)}
-          textAnchor={labelAnchor}
-          fontSize={coordFontSize}
-          fontFamily="Geist Mono, monospace"
-          fill={color}
-          fillOpacity={0.65}
-        >
-          ({p.x}, {p.y})
-        </text>
-      </g>
-    );
-  });
+          {/* Label background for readability */}
+          <rect
+            x={px + chosenDx - 2}
+            y={nameLy - 1}
+            width={labelW + 4}
+            height={LABEL_H + 2}
+            fill="oklch(0.11 0.016 265)"
+            fillOpacity={0.7}
+            rx={3}
+          />
+          {/* Name label */}
+          <text
+            x={px + chosenDx + (chosenAnchor === "middle" ? labelW / 2 : 0)}
+            y={nameLy + pointFontSize - 1}
+            textAnchor={chosenAnchor}
+            fontSize={pointFontSize}
+            fontFamily="Bricolage Grotesque, system-ui, sans-serif"
+            fontWeight="600"
+            fill={color}
+          >
+            {p.name}
+          </text>
+          {/* Coord label */}
+          <text
+            x={px + chosenDx + (chosenAnchor === "middle" ? labelW / 2 : 0)}
+            y={coordLy + coordFontSize - 1}
+            textAnchor={chosenAnchor}
+            fontSize={coordFontSize}
+            fontFamily="Geist Mono, monospace"
+            fill={color}
+            fillOpacity={0.65}
+          >
+            ({p.x}, {p.y})
+          </text>
+        </g>
+      );
+    });
+
+    return resolved;
+  }, [
+    points,
+    pointColours,
+    pointsByCoord,
+    toSvgX,
+    toSvgY,
+    pointFontSize,
+    coordFontSize,
+    LABEL_H,
+  ]);
 
   const svgElement = (
     <svg
